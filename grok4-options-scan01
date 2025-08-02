@@ -1,0 +1,126 @@
+## grok 4 - 20250731
+##version 1.0
+##python
+
+import os
+import requests
+import json
+import pandas as pd
+from datetime import date, timedelta
+import time
+
+# Set your Alpaca API keys here
+API_KEY = 'YOUR_ALPACA_API_KEY'  # Replace with your actual key
+API_SECRET = 'YOUR_ALPACA_API_SECRET'  # Replace with your actual secret
+
+BASE_URL = 'https://data.alpaca.markets/v2'
+HEADERS = {
+    'APCA-API-KEY-ID': API_KEY,
+    'APCA-API-SECRET-KEY': API_SECRET
+}
+
+# Popular symbols with weekly options
+SYMBOLS = ['SPY', 'QQQ', 'IWM', 'DIA', 'AAPL', 'AMZN', 'TSLA', 'NVDA', 'MSFT', 'GOOGL']
+
+def get_next_friday():
+    today = date.today()
+    weekday = today.weekday()
+    days_to_friday = (4 - weekday) % 7
+    if days_to_friday == 0:  # If today is Friday, look for next Friday
+        days_to_friday = 7
+    next_friday = today + timedelta(days=days_to_friday)
+    return next_friday.isoformat()
+
+def get_all_contracts(symbol, expiration):
+    contracts = []
+    params = {
+        'root_symbols': symbol,
+        'expiration_date': expiration,
+        'page_size': 1000
+    }
+    while True:
+        response = requests.get(f'{BASE_URL}/options/contracts', headers=HEADERS, params=params)
+        if not response.ok:
+            print(f"Error fetching contracts for {symbol}: {response.text}")
+            return []
+        data = response.json()
+        contracts.extend(data['contracts'])
+        next_page_token = data.get('next_page_token')
+        if not next_page_token:
+            break
+        params['page_token'] = next_page_token
+    return contracts
+
+# Main logic
+expiration_date = get_next_friday()
+print(f"Scanning weekly options expiring on {expiration_date}")
+
+# Get underlying prices for all symbols in one call
+symbols_str = ','.join(SYMBOLS)
+stock_snap_response = requests.get(f'{BASE_URL}/stocks/snapshots?symbols={symbols_str}', headers=HEADERS)
+if not stock_snap_response.ok:
+    print(f"Error fetching stock snapshots: {stock_snap_response.text}")
+    exit(1)
+stock_snapshots = stock_snap_response.json()
+
+results = []
+
+for symbol in SYMBOLS:
+    if symbol not in stock_snapshots or not stock_snapshots[symbol]:
+        print(f"No snapshot for {symbol}, skipping.")
+        continue
+    underlying_price = stock_snapshots[symbol]['latest_trade']['price']
+    print(f"Processing {symbol} at price {underlying_price}")
+    
+    contracts = get_all_contracts(symbol, expiration_date)
+    if not contracts:
+        continue
+    
+    filtered_contracts = []
+    for contract in contracts:
+        strike = float(contract['strike_price'])
+        # Filter to near-the-money options (within 5% of underlying)
+        if abs(strike - underlying_price) / underlying_price < 0.05:
+            filtered_contracts.append(contract)
+    
+    for contract in filtered_contracts:
+        opt_symbol = contract['symbol']
+        strike = float(contract['strike_price'])
+        snap_response = requests.get(f'{BASE_URL}/options/snapshots/{opt_symbol}', headers=HEADERS)
+        if not snap_response.ok:
+            print(f"Error fetching snapshot for {opt_symbol}: {snap_response.text}")
+            continue
+        snap = snap_response.json()
+        latest_quote = snap.get('latest_quote', {})
+        if not latest_quote:
+            continue
+        bid_price = latest_quote.get('bid_price', 0)
+        ask_price = latest_quote.get('ask_price', 0)
+        premium = (bid_price + ask_price) / 2 if bid_price + ask_price > 0 else 0
+        iv = snap.get('greek', {}).get('implied_volatility', 0)
+        
+        results.append({
+            'Underlying': symbol,
+            'Option Symbol': opt_symbol,
+            'Type': 'Call' if 'C' in opt_symbol else 'Put',
+            'Strike': strike,
+            'Premium': premium,
+            'IV': iv,
+            'Underlying Price': underlying_price
+        })
+        
+        # Respect rate limits (~200/min)
+        time.sleep(0.3)
+
+if results:
+    df = pd.DataFrame(results)
+    # Sort by premium descending to find the "best" (highest) premiums
+    df_sorted = df.sort_values(by='Premium', ascending=False)
+    print("\nTop options by premium:")
+    print(df_sorted.head(20))  # Show top 20
+    # Optionally save to CSV
+    df_sorted.to_csv('best_weekly_options.csv', index=False)
+    print("Results saved to best_weekly_options.csv")
+else:
+    print("No results found.")
+
