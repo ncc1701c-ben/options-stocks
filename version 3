@@ -1,0 +1,112 @@
+
+
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict
+import pandas as pd
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical import OptionHistoricalDataClient
+from alpaca.data.requests import OptionChainRequest
+from alpaca.data.enums import OptionType, DataFeed
+from alpaca.trading.requests import GetAssetsRequest
+from alpaca.trading.enums import AssetClass, AssetStatus
+
+# Set your Alpaca API keys as environment variables or hardcode them (not recommended for security)
+API_KEY = os.getenv('ALPACA_API_KEY', 'your_api_key_here')
+API_SECRET = os.getenv('ALPACA_API_SECRET', 'your_api_secret_here')
+
+# Initialize clients (use paper=True for testing; set to False for live)
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+option_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
+
+# Step 1: Fetch list of active, tradable, optionable US equity tickers
+search_params = GetAssetsRequest(
+    asset_class=AssetClass.US_EQUITY,
+    status=AssetStatus.ACTIVE
+)
+assets = trading_client.get_all_assets(search_params)
+
+# Filter for tradable and optionable stocks
+stocks: List[str] = [asset.symbol for asset in assets if asset.tradable and getattr(asset, 'optionable', False)]
+
+# Limit to 7000 tickers as per request (Alpaca typically returns ~8000-10000 US equities; slice if needed)
+stocks = stocks[:7000]
+print(f"Scanning {len(stocks)} optionable tickers...")
+
+# Step 2: Determine the next weekly expiration date (next Friday)
+today = datetime.utcnow().date()
+weekday = today.weekday()
+days_to_friday = (4 - weekday) % 7
+if days_to_friday == 0:
+    days_to_friday = 7  # If today is Friday, use next week's Friday
+next_expiration = (today + timedelta(days=days_to_friday)).isoformat()
+
+# Step 3: Scan for best -0.25 delta put options and calculate weekly yield
+results: List[Dict] = []
+
+for symbol in stocks:
+    try:
+        # Request the option chain for puts expiring on the next weekly date
+        chain_request = OptionChainRequest(
+            underlying_symbols=[symbol],
+            expiration_date=next_expiration,
+            option_type=OptionType.PUT,
+            feed=DataFeed.SIP  # Use SIP for comprehensive data; IEX for free tier if limited
+        )
+        chain = option_client.get_option_chain(chain_request)
+
+        if not chain:
+            continue  # No options available for this expiration
+
+        # Find the put with delta closest to -0.25
+        closest_contract = None
+        closest_delta_diff = float('inf')
+        for contract_symbol, snapshot in chain.items():
+            delta = snapshot.greeks.delta if snapshot.greeks else None
+            if delta is None:
+                continue
+            delta_diff = abs(delta + 0.25)  # Target -0.25
+            if delta_diff < closest_delta_diff:
+                closest_delta_diff = delta_diff
+                closest_contract = (contract_symbol, snapshot)
+
+        if closest_contract and closest_delta_diff < 0.05:  # Threshold to ensure it's reasonably close
+            contract_symbol, snapshot = closest_contract
+            # Premium for selling: use bid price (what you receive)
+            premium = snapshot.latest_quote.bid_price if snapshot.latest_quote else (snapshot.latest_quote.ask_price + snapshot.latest_quote.bid_price) / 2
+            strike = snapshot.strike_price  # Assuming snapshot has strike_price; adjust if needed
+            iv = snapshot.greeks.implied_volatility if snapshot.greeks else None
+
+            # Calculate weekly yield % (premium / strike) * 100; for cash-secured put, this is return on capital
+            weekly_yield = (premium / strike) * 100 if strike > 0 else 0
+
+            results.append({
+                'ticker': symbol,
+                'expiration': next_expiration,
+                'strike': strike,
+                'delta': snapshot.greeks.delta,
+                'iv': iv,
+                'premium': premium,
+                'weekly_yield_pct': weekly_yield
+            })
+
+    except Exception as e:
+        print(f"Error scanning {symbol}: {e}")
+        continue
+
+# Step 4: Sort by highest weekly yield and output
+if results:
+    df = pd.DataFrame(results)
+    df = df.sort_values(by='weekly_yield_pct', ascending=False)
+    print("Top options by weekly yield:")
+    print(df.head(50))  # Display top 50; adjust as needed
+    df.to_csv('options_scanner_results.csv', index=False)  # Save to CSV for review
+else:
+    print("No suitable options found.")
+
+# Notes:
+# - Run this script nightly (e.g., via cron job or scheduler) after market close.
+# - High IV contributes to higher premiums/yields, so sorting by yield prioritizes high-IV opportunities.
+# - API rate limits: Alpaca allows ~200 requests/min; scanning 7000 may take time or hit limits—consider batching or filtering stocks further (e.g., by market cap/volume).
+# - Ensure your Alpaca account has options data access (may require subscription for real-time SIP data).
+# - This is for educational purposes; options trading involves risk—test in paper mode first.
