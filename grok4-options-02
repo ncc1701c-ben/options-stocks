@@ -1,0 +1,163 @@
+#2025/08/01
+#version 2
+#python
+
+import os
+import requests
+import json
+import pandas as pd
+from datetime import date, timedelta
+import time
+from itertools import chain
+
+# Set your Alpaca API keys here
+API_KEY = 'YOUR_ALPACA_API_KEY'  # Replace with your actual key
+API_SECRET = 'YOUR_ALPACA_API_SECRET'  # Replace with your actual secret
+
+BASE_URL = 'https://data.alpaca.markets/v2'
+HEADERS = {
+    'APCA-API-KEY-ID': API_KEY,
+    'APCA-API-SECRET-KEY': API_SECRET
+}
+
+BATCH_SIZE = 200  # Max symbols per snapshot request (adjust based on tier/limits)
+DELTA_TARGET = -0.25
+DELTA_TOLERANCE = 0.03  # Allow delta within -0.25 +/- 0.03
+
+def get_next_friday():
+    today = date.today()
+    weekday = today.weekday()
+    days_to_friday = (4 - weekday) % 7
+    if days_to_friday == 0:  # If today is Friday, look for next Friday
+        days_to_friday = 7
+    next_friday = today + timedelta(days=days_to_friday)
+    return next_friday.isoformat()
+
+def get_all_contracts(expiration):
+    contracts = []
+    params = {
+        'expiration_date': expiration,
+        'page_size': 10000,  # Max per docs
+        'status': 'active'
+    }
+    while True:
+        response = requests.get(f'{BASE_URL}/options/contracts', headers=HEADERS, params=params)
+        if not response.ok:
+            print(f"Error fetching contracts: {response.text}")
+            return []
+        data = response.json()
+        contracts.extend(data['contracts'])
+        next_page_token = data.get('next_page_token')
+        if not next_page_token:
+            break
+        params['page_token'] = next_page_token
+        time.sleep(0.3)  # Rate limit buffer
+    return contracts
+
+def get_batched_snapshots(symbols, is_options=False):
+    snapshots = {}
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        batch_str = ','.join(batch)
+        endpoint = '/options/snapshots' if is_options else '/stocks/snapshots'
+        response = requests.get(f'{BASE_URL}{endpoint}?symbols={batch_str}', headers=HEADERS)
+        if not response.ok:
+            print(f"Error fetching {'option' if is_options else 'stock'} snapshots: {response.text}")
+            continue
+        data = response.json()
+        snapshots.update(data)
+        time.sleep(0.3)  # Rate limit buffer
+    return snapshots
+
+# Main logic
+expiration_date = get_next_friday()
+print(f"Scanning all weekly options expiring on {expiration_date}")
+
+# Get all weekly contracts across all underlyings
+all_contracts = get_all_contracts(expiration_date)
+if not all_contracts:
+    print("No contracts found.")
+    exit(1)
+
+# Extract unique underlying symbols
+unique_symbols = list(set(c['root_symbol'] for c in all_contracts if 'root_symbol' in c))
+print(f"Found {len(unique_symbols)} unique underlyings with weekly options.")
+
+# Get batched stock snapshots
+stock_snapshots = get_batched_snapshots(unique_symbols, is_options=False)
+
+# Filter to put contracts that are potentially OTM (strike < underlying and not too deep)
+filtered_contracts = []
+underlying_prices = {}
+for symbol in unique_symbols:
+    snap = stock_snapshots.get(symbol)
+    if not snap:
+        continue
+    price = snap.get('latest_trade', {}).get('price', 0)
+    if price <= 0:
+        continue
+    underlying_prices[symbol] = price
+
+for contract in all_contracts:
+    symbol = contract.get('root_symbol')
+    if symbol not in underlying_prices:
+        continue
+    if contract['option_type'] != 'put':  # Only puts for negative delta
+        continue
+    underlying_price = underlying_prices[symbol]
+    strike = float(contract['strike_price'])
+    # Broad filter: OTM puts, strike between 50% and 100% of underlying
+    if strike < underlying_price and strike > underlying_price * 0.5:
+        filtered_contracts.append(contract)
+
+print(f"Found {len(filtered_contracts)} potential OTM put contracts.")
+
+# Extract option symbols
+opt_symbols = [c['symbol'] for c in filtered_contracts]
+
+# Get batched option snapshots
+option_snapshots = get_batched_snapshots(opt_symbols, is_options=True)
+
+# Process results, filtering on delta
+results = []
+for contract in filtered_contracts:
+    opt_symbol = contract['symbol']
+    symbol = contract['root_symbol']
+    underlying_price = underlying_prices.get(symbol, 0)
+    strike = float(contract['strike_price'])
+    snap = option_snapshots.get(opt_symbol)
+    if not snap:
+        continue
+    latest_quote = snap.get('latest_quote', {})
+    bid_price = latest_quote.get('bid_price', 0)
+    ask_price = latest_quote.get('ask_price', 0)
+    premium = (bid_price + ask_price) / 2 if bid_price + ask_price > 0 else 0
+    greeks = snap.get('greek', {})
+    iv = greeks.get('implied_volatility', 0)
+    delta_val = greeks.get('delta', 0)
+    
+    # Filter for delta near -0.25
+    if abs(delta_val - DELTA_TARGET) < DELTA_TOLERANCE:
+        results.append({
+            'Underlying': symbol,
+            'Option Symbol': opt_symbol,
+            'Type': 'Put',
+            'Strike': strike,
+            'Premium': premium,
+            'IV': iv,
+            'Delta': delta_val,
+            'Underlying Price': underlying_price
+        })
+
+if results:
+    df = pd.DataFrame(results)
+    # Sort by premium descending to find the "best" (highest) premiums
+    df_sorted = df.sort_values(by='Premium', ascending=False)
+    print("\nTop options by premium:")
+    print(df_sorted.head(20))  # Show top 20
+    # Save to CSV
+    df_sorted.to_csv('best_weekly_options_delta_minus_025.csv', index=False)
+    print("Results saved to best_weekly_options_delta_minus_025.csv")
+else:
+    print("No results found.")
+
